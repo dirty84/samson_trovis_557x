@@ -11,13 +11,36 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from modbus_connection import ModbusError
+from modbus_connection import ModbusError, ModbusExceptionError
 from trovis_modbus import DEFAULT_WRITE_ACCESS_CODE, Trovis557x
 
-from .const import CONF_ACCESS_CODE, DOMAIN, SCAN_INTERVAL
+from .const import (
+    CONF_ACCESS_CODE,
+    CONF_EXCLUDED_COILS,
+    CONF_EXCLUDED_REGISTERS,
+    DOMAIN,
+    SCAN_INTERVAL,
+)
+from .read_exclusions import format_address_list, parse_address_list
 
 _LOGGER = logging.getLogger(__name__)
 _DEV_LOGGER = logging.getLogger("TROVIS dev log")
+
+# Modbus exception code 2: the controller does not implement the address.
+# Older firmware (e.g. TROVIS 5573 V2.00) lacks registers that the model
+# profile expects, so a single unknown address must not fail the full read.
+_ILLEGAL_DATA_ADDRESS = 2
+
+# Address space of a refused block -> (option key, single-address reader name).
+# Only spaces that the read-exclusion options cover are handled.
+_LEARNABLE_SPACES: dict[str, tuple[str, str]] = {
+    "holding": (CONF_EXCLUDED_REGISTERS, "read_holding_registers"),
+    "coil": (CONF_EXCLUDED_COILS, "read_coils"),
+}
+
+# Upper bound for addresses auto-excluded per space. Prevents a misbehaving
+# link (wrong unit ID, foreign device) from silently excluding everything.
+_MAX_AUTO_EXCLUDED_PER_SPACE = 64
 
 type TrovisConfigEntry = ConfigEntry["TrovisCoordinator"]
 
@@ -64,6 +87,15 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
 
         try:
             await self.device.async_update()
+        except ModbusExceptionError as err:
+            # Unknown address on this firmware: learn it, persist it as a
+            # read exclusion and reload so the next poll skips it.
+            if await self._async_learn_unsupported_addresses(err):
+                raise UpdateFailed(
+                    "Unsupported Modbus addresses excluded automatically; "
+                    "reloading TROVIS integration"
+                ) from err
+            raise UpdateFailed(f"Error communicating with Trovis: {err}") from err
         except ModbusError as err:
             if self._developer_mode:
                 _DEV_LOGGER.info(
@@ -82,3 +114,115 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
             )
 
         return self.device
+
+    async def _async_learn_unsupported_addresses(
+        self,
+        err: ModbusExceptionError,
+    ) -> bool:
+        """Exclude addresses the controller refused and schedule a reload.
+
+        Returns True if new exclusions were stored, False if the error is not
+        an auto-recoverable "illegal data address" on a planned block read.
+        """
+        block = getattr(err, "block", None)
+        if (
+            block is None
+            or err.exception_code != _ILLEGAL_DATA_ADDRESS
+            or block.space not in _LEARNABLE_SPACES
+            or block.count < 1
+        ):
+            return False
+
+        option_key, reader_name = _LEARNABLE_SPACES[block.space]
+        block_addresses = range(block.address, block.address + block.count)
+
+        # Narrow a multi-address block down to the addresses that are really
+        # missing, so valid neighbours in the same block keep being read.
+        refused = await self._async_probe_single_addresses(
+            reader_name,
+            block_addresses,
+        )
+        if refused is None:
+            # Link problem while probing: do not exclude anything.
+            return False
+        if not refused:
+            # Every single address answered, only the combined read failed:
+            # fall back to excluding the whole block.
+            refused = set(block_addresses)
+
+        entry = self.config_entry
+        try:
+            current = parse_address_list(str(entry.options.get(option_key, "") or ""))
+        except ValueError:
+            current = frozenset()
+
+        merged = set(current) | refused
+        if merged == set(current):
+            # Already excluded but still refused: nothing new to learn, so
+            # do not reload in a loop.
+            return False
+        if len(merged) > _MAX_AUTO_EXCLUDED_PER_SPACE:
+            _LOGGER.error(
+                "%s: Controller refused %s %s; not auto-excluding because the "
+                "limit of %d excluded %s addresses would be exceeded. Check "
+                "unit ID and connection",
+                entry.title,
+                block.space,
+                format_address_list(refused),
+                _MAX_AUTO_EXCLUDED_PER_SPACE,
+                block.space,
+            )
+            return False
+
+        value = format_address_list(merged)
+        _LOGGER.warning(
+            "%s: Controller does not support %s address(es) %s "
+            "(Modbus exception 2, likely older firmware). Excluding them "
+            "from reads; %s is now '%s'",
+            entry.title,
+            block.space,
+            format_address_list(refused),
+            option_key,
+            value,
+        )
+
+        options = dict(entry.options)
+        options[option_key] = value
+        if self.hass.config_entries.async_update_entry(entry, options=options):
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
+        return True
+
+    async def _async_probe_single_addresses(
+        self,
+        reader_name: str,
+        addresses: range,
+    ) -> set[int] | None:
+        """Return the addresses the controller refuses when read one by one.
+
+        Returns None if the link failed while probing.
+        """
+        unit = getattr(self.device, "_unit", None)
+        reader = getattr(unit, reader_name, None) if unit is not None else None
+        if reader is None or len(addresses) == 1:
+            # Single-address block or no direct reader: the block is the answer.
+            return set(addresses)
+
+        refused: set[int] = set()
+        for address in addresses:
+            try:
+                await reader(address, 1)
+            except ModbusExceptionError as err:
+                if err.exception_code == _ILLEGAL_DATA_ADDRESS:
+                    refused.add(address)
+                else:
+                    # Any other exception: do not guess, keep this address.
+                    _LOGGER.debug(
+                        "Probe of address %d returned exception %s",
+                        address,
+                        err.exception_code,
+                    )
+            except ModbusError as err:
+                # Link problem during probing: abort, exclude nothing new.
+                _LOGGER.debug("Probing aborted at address %d: %s", address, err)
+                return None
+        return refused
