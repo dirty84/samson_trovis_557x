@@ -454,6 +454,11 @@ class TrovisEntity(CoordinatorEntity["TrovisCoordinator"]):
         # Keep the old full-refresh path for those exceptional writes only.
         await self.coordinator.async_request_refresh()
 
+    def _mode_label(self) -> str:
+        """Return a short circuit label (Rk1 ...) for operating-mode logs."""
+        index = getattr(self._subsystem, "_index", None)
+        return f"Rk{index}" if index is not None else type(self._subsystem).__name__
+
     async def _async_set_operating_mode(self, value: object) -> None:
         """Set one external operating mode without the HA write-access gate."""
         from trovis_modbus import (
@@ -462,6 +467,31 @@ class TrovisEntity(CoordinatorEntity["TrovisCoordinator"]):
             TrovisWriteAccessError,
             TrovisWriteVerificationError,
         )
+
+        from .fw200_mode import (
+            Fw200ModeError,
+            async_set_mode_via_status_coils,
+            needs_status_coil_fallback,
+        )
+
+        if needs_status_coil_fallback(self._subsystem):
+            # Firmware without the effective-mode register (e.g. 5573 FW 2.00):
+            # write once, verify through the status coils instead.
+            try:
+                await async_set_mode_via_status_coils(
+                    self._subsystem,
+                    value,
+                    access_code=self.coordinator.access_code,
+                    label=self._mode_label(),
+                )
+            except (
+                Fw200ModeError,
+                TrovisWriteAccessDisabledError,
+                TrovisWriteAccessError,
+            ) as err:
+                raise HomeAssistantError(str(err)) from err
+            self.coordinator.async_set_updated_data(self.coordinator.device)
+            return
 
         try:
             await self._subsystem.async_set_operating_mode(
@@ -487,6 +517,28 @@ class TrovisEntity(CoordinatorEntity["TrovisCoordinator"]):
             TrovisWriteAccessError,
             TrovisWriteVerificationError,
         )
+
+        from .fw200_mode import (
+            Fw200ModeError,
+            async_release_via_ownership_coil,
+            needs_status_coil_fallback,
+        )
+
+        if needs_status_coil_fallback(self._subsystem):
+            try:
+                await async_release_via_ownership_coil(
+                    self._subsystem,
+                    access_code=self.coordinator.access_code,
+                    label=self._mode_label(),
+                )
+            except (
+                Fw200ModeError,
+                TrovisWriteAccessDisabledError,
+                TrovisWriteAccessError,
+            ) as err:
+                raise HomeAssistantError(str(err)) from err
+            self.coordinator.async_set_updated_data(self.coordinator.device)
+            return
 
         try:
             await self._subsystem.async_release_operating_mode_control(

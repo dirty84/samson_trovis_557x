@@ -373,15 +373,22 @@ def test_dashboard_controller_button_helper_contract() -> None:
 
 
 def test_timeout_retry_contract() -> None:
-    """Keep TROVIS read retries local to the integration-owned unit proxy."""
-    init_source = (COMPONENT / "__init__.py").read_text(encoding="utf-8")
+    """Keep TROVIS read retries local to the integration-owned unit proxy.
 
-    assert "_READ_RETRIES = 2" in init_source
-    assert "class _ReadRetryModbusUnit" in init_source
-    assert '"read_holding_registers"' in init_source
-    assert '"read_coils"' in init_source
-    assert "except ModbusTimeoutError" in init_source
+    The proxy lives in modbus_link.py (resync before retry, minimum timeout,
+    length check); __init__.py only wires it in.
+    """
+    init_source = (COMPONENT / "__init__.py").read_text(encoding="utf-8")
+    link_source = (COMPONENT / "modbus_link.py").read_text(encoding="utf-8")
+
+    assert "READ_RETRIES = 2" in link_source
+    assert "class ReadRetryModbusUnit" in link_source
+    assert '"read_holding_registers"' in link_source
+    assert '"read_coils"' in link_source
+    assert "except ModbusTimeoutError" in link_source
+    assert "from .modbus_link import with_read_retries" in init_source
     assert "set_message_spacing" not in init_source
+    assert "set_message_spacing" not in link_source
 
 
 def test_verified_write_publishes_without_full_poll_contract() -> None:
