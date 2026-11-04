@@ -194,3 +194,59 @@ async def test_writes_are_forwarded_without_retry() -> None:
 def test_wrapping_is_idempotent() -> None:
     wrapped = _wrap(SlowRtuUnit(set()))
     assert link.with_read_retries(wrapped, "again") is wrapped
+
+
+@pytest.mark.asyncio
+async def test_failed_open_is_retried_with_backoff() -> None:
+    """'could not open serial port' after a resync must not fail the poll."""
+    from modbus_connection import ModbusConnectionError
+
+    class FlakyOpen(SlowRtuUnit):
+        def __init__(self) -> None:
+            super().__init__(set())
+            self._open_failures = 2
+
+        async def read_holding_registers(self, address: int, count: int):
+            self.calls.append((address, count))
+            if self._open_failures:
+                self._open_failures -= 1
+                raise ModbusConnectionError("could not open serial port esphome-hass://x")
+            return _registers(address, count)
+
+    sleeps: list[float] = []
+
+    async def record(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    unit = FlakyOpen()
+    wrapped = link.ReadRetryModbusUnit(unit, "test", sleep=record)
+    assert await wrapped.read_holding_registers(3, 2) == [3, 4]
+    assert sleeps == list(link.CONNECT_BACKOFF_SECONDS[:2])
+    assert wrapped.reconnect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_open_failures_exhausted_raise() -> None:
+    from modbus_connection import ModbusConnectionError
+
+    class NeverOpens(SlowRtuUnit):
+        async def read_holding_registers(self, address: int, count: int):
+            self.calls.append((address, count))
+            raise ModbusConnectionError("could not open serial port")
+
+    unit = NeverOpens(set())
+    with pytest.raises(ModbusConnectionError):
+        await _wrap(unit).read_holding_registers(0, 1)
+    assert len(unit.calls) == len(link.CONNECT_BACKOFF_SECONDS) + 1
+
+
+def test_link_grace_bridges_only_within_window() -> None:
+    grace = link.LinkGrace(grace_seconds=180)
+    assert grace.bridge(10.0) is False  # no good poll yet: never bridge
+    grace.success(100.0)
+    assert grace.bridge(160.0) is True
+    assert grace.bridge(280.0) is True  # exactly at the limit
+    assert grace.bridge(281.0) is False  # older than the window: surface it
+    assert grace.failures == 2
+    assert grace.success(300.0) == 2
+    assert grace.failures == 0

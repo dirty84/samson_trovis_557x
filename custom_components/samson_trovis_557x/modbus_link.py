@@ -24,6 +24,12 @@ Countermeasures in this module
    settle time so trailing bytes from the controller are gone.
 3. Validate the length of every read result, so a misaligned frame can never
    be decoded into wrong values silently.
+4. Re-open the link after a failed open (``ModbusConnectionError``) with a
+   short backoff. Behind the ESPHome serial proxy, re-opening right after a
+   resync occasionally fails ("could not open serial port") although the
+   ESP itself stays connected; one failed open used to fail the whole poll.
+5. ``LinkGrace``: let the coordinator bridge short link outages with the last
+   good values instead of turning every entity unavailable for a minute.
 
 The module is free of Home Assistant imports so it can be unit-tested
 without a Home Assistant installation.
@@ -64,6 +70,15 @@ PROTOCOL_RETRIES = 1
 # keep sending residue for ~100 ms after a malformed reply.
 RESYNC_SETTLE_SECONDS = 0.5
 
+# Re-open attempts after a failed open, with the pause before each attempt.
+# Only reads use this: a failed open means no request reached the controller.
+CONNECT_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# How long the coordinator may keep the last good values while the link is
+# down, and how often it retries in that state.
+LINK_GRACE_SECONDS = 180.0
+DEGRADED_RETRY_SECONDS = 15.0
+
 type LogFunc = Callable[..., None]
 type SleepFunc = Callable[[float], Awaitable[Any]]
 
@@ -99,6 +114,7 @@ class ReadRetryModbusUnit:
         self._min_timeout = min_timeout
         self._settle_seconds = settle_seconds
         self.resync_count = 0  # diagnostics: number of link resyncs so far
+        self.reconnect_count = 0  # diagnostics: number of re-open attempts so far
 
     def __getattr__(self, name: str) -> Any:
         """Forward every operation not overridden below to the shared unit."""
@@ -140,6 +156,7 @@ class ReadRetryModbusUnit:
         call = f"{method_name}({address}, {count})"
         timeouts = 0
         unusable = 0
+        reconnects = 0
 
         while True:
             try:
@@ -164,6 +181,36 @@ class ReadRetryModbusUnit:
                 )
                 await self._resync()
                 continue
+            except ModbusConnectionError as err:
+                # Link could not be (re)opened: nothing was sent, so retrying
+                # the read is safe. Back off so the proxy can release the port.
+                if reconnects >= len(CONNECT_BACKOFF_SECONDS):
+                    self._log(
+                        "%s: %s link could not be opened after %d attempts: %s",
+                        self._device_name,
+                        call,
+                        reconnects + 1,
+                        err,
+                    )
+                    raise
+                delay = CONNECT_BACKOFF_SECONDS[reconnects]
+                reconnects += 1
+                self.reconnect_count += 1
+                self._log(
+                    "%s: %s link error (%s), reopen in %.1fs (%d/%d).",
+                    self._device_name,
+                    call,
+                    err,
+                    delay,
+                    reconnects,
+                    len(CONNECT_BACKOFF_SECONDS),
+                )
+                with contextlib.suppress(ModbusConnectionError, ModbusError, OSError):
+                    disconnect = getattr(self._unit, "disconnect", None)
+                    if callable(disconnect):
+                        await disconnect()
+                await self._sleep(delay)
+                continue
             except ModbusProtocolError as err:
                 # Includes ModbusDesyncError and our own length check.
                 if unusable >= PROTOCOL_RETRIES:
@@ -180,14 +227,15 @@ class ReadRetryModbusUnit:
                 await self._resync()
                 continue
 
-            if timeouts or unusable:
+            if timeouts or unusable or reconnects:
                 self._log(
-                    "%s: %s succeeded after %d timeout(s) and %d unusable "
-                    "reply(ies).",
+                    "%s: %s succeeded after %d timeout(s), %d unusable "
+                    "reply(ies) and %d reopen(s).",
                     self._device_name,
                     call,
                     timeouts,
                     unusable,
+                    reconnects,
                 )
             return result
 
@@ -229,6 +277,41 @@ def _check_length(call: str, result: Any, count: int) -> None:
         raise ReadLengthError(
             f"{call}: expected {count} registers, got {length}"
         )
+
+
+class LinkGrace:
+    """Decide whether a failed poll may keep the last good values.
+
+    Pure bookkeeping (no Home Assistant, no clock of its own): the caller
+    passes monotonic timestamps. A link error is bridged while the last good
+    poll is at most ``grace_seconds`` old; after that the error must surface
+    so entities turn unavailable and safety logic (e.g. the HA standby
+    automation) sees the outage.
+    """
+
+    def __init__(self, grace_seconds: float = LINK_GRACE_SECONDS) -> None:
+        if grace_seconds < 0:
+            raise ValueError("grace_seconds must be non-negative")
+        self.grace_seconds = grace_seconds
+        self.last_success: float | None = None
+        self.failures = 0  # consecutive bridged failures
+
+    def success(self, now: float) -> int:
+        """Record a good poll; return how many failures it ended."""
+        ended, self.failures = self.failures, 0
+        self.last_success = now
+        return ended
+
+    def bridge(self, now: float) -> bool:
+        """Return True if this failure may be bridged with the last values."""
+        if self.last_success is None or now - self.last_success > self.grace_seconds:
+            return False
+        self.failures += 1
+        return True
+
+    def age(self, now: float) -> float:
+        """Seconds since the last good poll (inf if there was none)."""
+        return float("inf") if self.last_success is None else now - self.last_success
 
 
 def with_read_retries(unit: Any, device_name: str, **kwargs: Any) -> Any:

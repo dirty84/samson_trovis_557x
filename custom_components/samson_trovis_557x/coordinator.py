@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import timedelta
 from time import monotonic
 
 from homeassistant.config_entries import ConfigEntry
@@ -29,6 +30,7 @@ from .const import (
     DOMAIN,
     SCAN_INTERVAL,
 )
+from .modbus_link import DEGRADED_RETRY_SECONDS, LinkGrace
 from .read_exclusions import format_address_list, parse_address_list
 
 _LOGGER = logging.getLogger(__name__)
@@ -93,6 +95,9 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
         self.device = device
         self._developer_mode = developer_mode
         self._sensor_redetect_done = False
+        # Short link outages (ESPHome serial proxy) keep the last good values
+        # instead of turning every entity unavailable; see LinkGrace.
+        self._grace = LinkGrace()
 
         if developer_mode:
             _DEV_LOGGER.setLevel(logging.INFO)
@@ -124,6 +129,23 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
             raise UpdateFailed(f"Error communicating with Trovis: {err}") from err
         except (ModbusConnectionError, ModbusTimeoutError) as err:
             # Link problems are never treated as unsupported addresses.
+            now = monotonic()
+            if self._grace.bridge(now):
+                # Keep the last good values and retry sooner. Values may be
+                # partly refreshed by the failed poll; all of them are real
+                # controller readings.
+                self.update_interval = timedelta(seconds=DEGRADED_RETRY_SECONDS)
+                _LOGGER.warning(
+                    "%s: link error (%s); keeping last values (%.0fs old, "
+                    "failure %d), retry in %.0fs",
+                    self.config_entry.title,
+                    err,
+                    self._grace.age(now),
+                    self._grace.failures,
+                    DEGRADED_RETRY_SECONDS,
+                )
+                return self.device
+            self.update_interval = SCAN_INTERVAL
             raise UpdateFailed(f"Error communicating with Trovis: {err}") from err
         except ModbusError as err:
             if await self._async_learn_from_garbled_block(err):
@@ -147,6 +169,14 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
                 monotonic() - started,
             )
 
+        ended = self._grace.success(monotonic())
+        if ended:
+            _LOGGER.info(
+                "%s: link recovered after %d failed poll(s)",
+                self.config_entry.title,
+                ended,
+            )
+        self.update_interval = SCAN_INTERVAL
         self._redetect_sensors_once()
         return self.device
 
