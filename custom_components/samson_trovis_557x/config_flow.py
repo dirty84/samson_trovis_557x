@@ -35,6 +35,8 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_DETECTED_SENSORS,
     CONF_DEVICE,
+    CONF_EXCLUDED_COILS,
+    CONF_EXCLUDED_REGISTERS,
     CONF_FRAMER,
     CONF_HOST,
     CONF_MODEL,
@@ -497,9 +499,20 @@ class TrovisConfigFlow(ConfigFlow, domain=DOMAIN):
             }
         )
 
+        # Keep learned read exclusions. They describe the controller firmware,
+        # not the transport, and dropping them forces a slow re-learning cycle
+        # with one reload per refused block on old firmware (e.g. FW 2.00).
+        # Only keep them if the same controller model answered the probe.
+        options: dict[str, Any] = {}
+        if entry.data.get(CONF_MODEL) == model:
+            for key in (CONF_EXCLUDED_REGISTERS, CONF_EXCLUDED_COILS):
+                value = entry.options.get(key)
+                if value:
+                    options[key] = value
+
         return self.async_update_reload_and_abort(
             entry,
             title=name,
             data=data,
-            options={},
+            options=options,
         )

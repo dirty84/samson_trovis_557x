@@ -25,9 +25,9 @@ from homeassistant.helpers.entity import DeviceInfo, async_generate_entity_id
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import slugify
 from modbus_connection import (
+    ModbusError,
     ModbusSerialParams,
     ModbusTcpParams,
-    ModbusTimeoutError,
 )
 
 from .const import (
@@ -57,6 +57,7 @@ from .const import (
     FRAMER_RTU,
     FRAMER_SOCKET,
 )
+from .modbus_link import with_read_retries as _with_read_retries
 from .read_exclusions import parse_address_list
 
 if TYPE_CHECKING:
@@ -77,7 +78,6 @@ ATTR_SIMULATION_VALUE = "value"
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
-_READ_RETRIES = 2
 
 
 def _socket_device(host: str, port: int) -> str:
@@ -246,79 +246,6 @@ else:
         apply_local_log_overrides()
 
 
-class _ReadRetryModbusUnit:
-    """TROVIS-local ModbusUnit proxy with timeout retries for pure reads.
-
-    The Home Assistant unit may be shared, so do not monkeypatch methods on the
-    Core-owned object itself. This proxy affects only the TROVIS consumer while
-    forwarding the complete remaining ModbusUnit surface unchanged.
-    """
-
-    def __init__(self, unit: Any, device_name: str) -> None:
-        self._unit = unit
-        self._device_name = device_name
-
-    def __getattr__(self, name: str) -> Any:
-        """Forward every operation not overridden below to the shared unit."""
-        return getattr(self._unit, name)
-
-    async def _read_with_retry(
-        self,
-        method_name: str,
-        address: int,
-        count: int,
-    ) -> Any:
-        method = getattr(self._unit, method_name)
-
-        for attempt in range(_READ_RETRIES + 1):
-            try:
-                result = await method(address, count)
-            except ModbusTimeoutError:
-                if attempt >= _READ_RETRIES:
-                    _log_read_retry(
-                        "%s: %s(%d, %d) timed out on all %d attempts.",
-                        self._device_name,
-                        method_name,
-                        address,
-                        count,
-                        _READ_RETRIES + 1,
-                    )
-                    raise
-
-                _log_read_retry(
-                    "%s: %s(%d, %d) timed out, retry %d/%d.",
-                    self._device_name,
-                    method_name,
-                    address,
-                    count,
-                    attempt + 1,
-                    _READ_RETRIES,
-                )
-                continue
-
-            if attempt:
-                _log_read_retry(
-                    "%s: %s(%d, %d) retry succeeded on attempt %d/%d.",
-                    self._device_name,
-                    method_name,
-                    address,
-                    count,
-                    attempt + 1,
-                    _READ_RETRIES + 1,
-                )
-            return result
-
-        raise AssertionError("unreachable")
-
-    async def read_holding_registers(self, address: int, count: int) -> list[int]:
-        """Read holding registers with up to two timeout retries."""
-        return await self._read_with_retry("read_holding_registers", address, count)
-
-    async def read_coils(self, address: int, count: int) -> list[bool]:
-        """Read coils with up to two timeout retries."""
-        return await self._read_with_retry("read_coils", address, count)
-
-
 def _log_read_retry(message: str, *args: object) -> None:
     """Log retry diagnostics only in developer mode or normal DEBUG logging."""
     if DEVELOPER_MODE and log_dev_info is not None:
@@ -328,10 +255,11 @@ def _log_read_retry(message: str, *args: object) -> None:
 
 
 def with_read_retries(unit: Any, device_name: str) -> Any:
-    """Return a TROVIS-local unit view with pure-read timeout retries."""
-    if isinstance(unit, _ReadRetryModbusUnit):
-        return unit
-    return _ReadRetryModbusUnit(unit, device_name)
+    """Return a TROVIS-local unit view with resynchronising read retries.
+
+    See ``modbus_link`` for why a plain retry is not enough on slow links.
+    """
+    return _with_read_retries(unit, device_name, log=_log_read_retry)
 
 
 def rk1_to_rk3_indices(coordinator: TrovisCoordinator) -> tuple[int, ...]:
@@ -654,6 +582,48 @@ PLATFORMS = [
 ]
 
 
+async def _async_redetect_sensors(
+    hass: HomeAssistant,
+    entry: ConfigEntry[TrovisCoordinator],
+    unit: Any,
+) -> bool:
+    """Re-run the safe sensor probe and persist newly detected sensors.
+
+    Returns True if the config entry was updated (caller schedules a reload).
+    Any failure is logged and ignored: setup must not fail because of the
+    optional sensor discovery.
+    """
+    from trovis_modbus import Trovis557x
+
+    try:
+        probe = await Trovis557x.async_probe(unit)
+    except (ModbusError, OSError, ValueError) as err:
+        _LOGGER.warning(
+            "%s: Sensor re-detection failed, keeping entry unchanged: %s",
+            entry.title,
+            err,
+        )
+        return False
+
+    sensors = sorted(set(probe.detected_sensors))
+    if not sensors:
+        _LOGGER.info(
+            "%s: Sensor re-detection found no physical sensors.", entry.title
+        )
+        return False
+
+    _LOGGER.warning(
+        "%s: Physical sensors detected after setup (%s); storing them and "
+        "reloading to create the measurement entities.",
+        entry.title,
+        ", ".join(sensors),
+    )
+    return hass.config_entries.async_update_entry(
+        entry,
+        data={**entry.data, CONF_DETECTED_SENSORS: sensors},
+    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry[TrovisCoordinator],
@@ -715,6 +685,16 @@ async def async_setup_entry(
     # do not prevent the config entry from loading when single optional Modbus
     # blocks (coils or registers) cannot be read.
     await coordinator.async_refresh()
+
+    # Entries created while the link was unstable may have been stored without
+    # any detected physical sensors (AF1, VF1, RüF1 ...): the sensor block read
+    # failed during the setup probe and was skipped as "optional". Re-probe once
+    # the link works; if sensors show up, persist them and reload so the
+    # measurement entities get created. No loop: the reload only happens when
+    # the stored list was empty and the probe found something.
+    if not detected_sensors and coordinator.last_update_success:
+        if await _async_redetect_sensors(hass, entry, unit):
+            hass.config_entries.async_schedule_reload(entry.entry_id)
 
     # Register the physical TROVIS controller before any platform constructs
     # sub-device entities. Home Assistant 2026.9 deprecates identifier tuples

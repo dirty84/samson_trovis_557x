@@ -411,7 +411,7 @@ _GLOBAL: tuple[TrovisSensorDescription, ...] = (
         "controller",
         "max_flow_setpoint",
         "Max flow setpoint",
-        state_class=None,
+        state_class=SensorStateClass.MEASUREMENT,
     ),
     _enum_sensor("controller", "switch_top", "Switch top"),
     _enum_sensor("controller", "switch_middle", "Switch middle"),
@@ -479,7 +479,8 @@ def _rk_sensor_descriptions(index: int) -> tuple[TrovisSensorDescription, ...]:
             f"Rk{index} - Flow setpoint",
             key=f"{prefix}_flow_setpoint",
             translation_key="flow_setpoint",
-            state_class=None,
+            # Weather-compensated, changes continuously: keep long-term stats.
+            state_class=SensorStateClass.MEASUREMENT,
             translation_placeholders=placeholders,
         ),
         _number_sensor(
@@ -488,7 +489,8 @@ def _rk_sensor_descriptions(index: int) -> tuple[TrovisSensorDescription, ...]:
             f"Rk{index} - Return setpoint",
             key=f"{prefix}_return_setpoint",
             translation_key="return_flow_temperature_setpoint",
-            state_class=None,
+            # Return-limit curve, changes with outdoor temperature.
+            state_class=SensorStateClass.MEASUREMENT,
             translation_placeholders=placeholders,
         ),
         _number_sensor(
