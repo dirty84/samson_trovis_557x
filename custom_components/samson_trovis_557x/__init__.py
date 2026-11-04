@@ -25,7 +25,6 @@ from homeassistant.helpers.entity import DeviceInfo, async_generate_entity_id
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import slugify
 from modbus_connection import (
-    ModbusError,
     ModbusSerialParams,
     ModbusTcpParams,
 )
@@ -582,48 +581,6 @@ PLATFORMS = [
 ]
 
 
-async def _async_redetect_sensors(
-    hass: HomeAssistant,
-    entry: ConfigEntry[TrovisCoordinator],
-    unit: Any,
-) -> bool:
-    """Re-run the safe sensor probe and persist newly detected sensors.
-
-    Returns True if the config entry was updated (caller schedules a reload).
-    Any failure is logged and ignored: setup must not fail because of the
-    optional sensor discovery.
-    """
-    from trovis_modbus import Trovis557x
-
-    try:
-        probe = await Trovis557x.async_probe(unit)
-    except (ModbusError, OSError, ValueError) as err:
-        _LOGGER.warning(
-            "%s: Sensor re-detection failed, keeping entry unchanged: %s",
-            entry.title,
-            err,
-        )
-        return False
-
-    sensors = sorted(set(probe.detected_sensors))
-    if not sensors:
-        _LOGGER.info(
-            "%s: Sensor re-detection found no physical sensors.", entry.title
-        )
-        return False
-
-    _LOGGER.warning(
-        "%s: Physical sensors detected after setup (%s); storing them and "
-        "reloading to create the measurement entities.",
-        entry.title,
-        ", ".join(sensors),
-    )
-    return hass.config_entries.async_update_entry(
-        entry,
-        data={**entry.data, CONF_DETECTED_SENSORS: sensors},
-    )
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry[TrovisCoordinator],
@@ -685,16 +642,6 @@ async def async_setup_entry(
     # do not prevent the config entry from loading when single optional Modbus
     # blocks (coils or registers) cannot be read.
     await coordinator.async_refresh()
-
-    # Entries created while the link was unstable may have been stored without
-    # any detected physical sensors (AF1, VF1, RüF1 ...): the sensor block read
-    # failed during the setup probe and was skipped as "optional". Re-probe once
-    # the link works; if sensors show up, persist them and reload so the
-    # measurement entities get created. No loop: the reload only happens when
-    # the stored list was empty and the probe found something.
-    if not detected_sensors and coordinator.last_update_success:
-        if await _async_redetect_sensors(hass, entry, unit):
-            hass.config_entries.async_schedule_reload(entry.entry_id)
 
     # Register the physical TROVIS controller before any platform constructs
     # sub-device entities. Home Assistant 2026.9 deprecates identifier tuples

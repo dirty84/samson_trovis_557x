@@ -23,6 +23,7 @@ from trovis_modbus import DEFAULT_WRITE_ACCESS_CODE, Trovis557x
 
 from .const import (
     CONF_ACCESS_CODE,
+    CONF_DETECTED_SENSORS,
     CONF_EXCLUDED_COILS,
     CONF_EXCLUDED_REGISTERS,
     DOMAIN,
@@ -91,6 +92,7 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
 
         self.device = device
         self._developer_mode = developer_mode
+        self._sensor_redetect_done = False
 
         if developer_mode:
             _DEV_LOGGER.setLevel(logging.INFO)
@@ -145,7 +147,59 @@ class TrovisCoordinator(DataUpdateCoordinator[Trovis557x]):
                 monotonic() - started,
             )
 
+        self._redetect_sensors_once()
         return self.device
+
+    def _redetect_sensors_once(self) -> None:
+        """Persist physical sensors if the entry was stored without any.
+
+        Entries created while the link was unstable can carry an empty sensor
+        list: the setup probe failed and skipped sensor discovery. The regular
+        poll reads the same sensor block (with learned exclusions applied), so
+        after a successful poll the valid sensor values tell which inputs are
+        wired. Store them once and reload so the measurement entities are
+        created. Runs at most once per coordinator lifetime; no extra Modbus
+        traffic, no reload loop (the stored list is non-empty afterwards).
+        """
+        if self._sensor_redetect_done:
+            return
+        self._sensor_redetect_done = True
+
+        entry = self.config_entry
+        stored = set(entry.data.get(CONF_DETECTED_SENSORS, ()))
+        stored.update(entry.options.get(CONF_DETECTED_SENSORS, ()))
+        if stored:
+            return
+
+        try:
+            names = self.device.sensors.detected_sensor_names
+            model_definition = self.device.model_definition
+            found = sorted(
+                {name for name in names if model_definition.supports_sensor(name)}
+            )
+        except (AttributeError, TypeError, ValueError) as err:
+            _LOGGER.warning(
+                "%s: Sensor re-detection skipped: %s", entry.title, err
+            )
+            return
+
+        if not found:
+            _LOGGER.info(
+                "%s: Sensor re-detection found no physical sensors.", entry.title
+            )
+            return
+
+        _LOGGER.warning(
+            "%s: Physical sensors detected after setup (%s); storing them and "
+            "reloading to create the measurement entities.",
+            entry.title,
+            ", ".join(found),
+        )
+        if self.hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_DETECTED_SENSORS: found},
+        ):
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
 
     async def _async_learn_unsupported_addresses(
         self,
