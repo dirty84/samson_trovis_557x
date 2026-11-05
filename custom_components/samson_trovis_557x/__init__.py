@@ -695,6 +695,20 @@ async def async_setup_entry(
     # blocks (coils or registers) cannot be read.
     await coordinator.async_refresh()
 
+    # Entities that depend on the hydronic configuration (Kp/Tn/Ty, 3-point
+    # mode, ...) are only created when the system code is known now. A setup
+    # during a link outage (e.g. a self-healing reload while the ESPHome
+    # serial proxy is down) would otherwise drop them until the next reload.
+    # ConfigEntryNotReady makes Home Assistant retry with backoff instead.
+    from .setup_guard import setup_not_ready_reason
+
+    if reason := setup_not_ready_reason(
+        coordinator.device,
+        last_update_success=coordinator.last_update_success,
+    ):
+        await coordinator.async_shutdown()
+        raise ConfigEntryNotReady(reason)
+
     # Register the physical TROVIS controller before any platform constructs
     # sub-device entities. Home Assistant 2026.9 deprecates identifier tuples
     # passed as ``via_device``; child DeviceInfo must now reference the actual
